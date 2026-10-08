@@ -1,0 +1,108 @@
+name: Guest wide printf Linux validation
+
+on:
+  push:
+    branches: [ci/libc-guest-wide-printf-validation]
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        phase: [baseline, fixed]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ matrix.phase == 'baseline' && 'b858fdc48e29c3ab7476782199d8a41999d46d59' || '21d21da3857e9c4bb3fd8a87a8919478015a6dce' }}
+          fetch-depth: 0
+          submodules: true
+      - name: Verify exact revision and install the same regression in baseline
+        run: |
+          if [ '${{ matrix.phase }}' = baseline ]; then
+            test "$(git rev-parse HEAD)" = 'b858fdc48e29c3ab7476782199d8a41999d46d59'
+            git show '21d21da3857e9c4bb3fd8a87a8919478015a6dce:core/libs/tests/Formatting.cpp' > core/libs/tests/Formatting.cpp
+          else
+            test "$(git rev-parse HEAD)" = '21d21da3857e9c4bb3fd8a87a8919478015a6dce'
+          fi
+      - name: Create isolated build environment
+        run: |
+          python3 -m venv .ci-venv
+          .ci-venv/bin/python -m pip install cmake==4.4.4 ninja==1.13.0
+          echo "$GITHUB_WORKSPACE/.ci-venv/bin" >> "$GITHUB_PATH"
+          gcc --version
+      - name: Configure Release with tests
+        run: >-
+          .ci-venv/bin/cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+          -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+          -DANYPS5_ENABLE_SPIRV_TOOLS=ON -DPython3_EXECUTABLE="$PWD/.ci-venv/bin/python"
+      - name: Build libc and all component executables
+        run: |
+          .ci-venv/bin/python - <<'PY'
+          import re, subprocess
+          from pathlib import Path
+          listed = subprocess.check_output(['.ci-venv/bin/ninja', '-C', 'build', '-t', 'targets', 'all'], text=True)
+          available = {line.split(':', 1)[0] for line in listed.splitlines() if ':' in line}
+          targets = [name for name in re.findall(r'add_test_executable\(\s*(\w+)', Path('core/libs/prx/libc/CMakeLists.txt').read_text()) if name in available]
+          subprocess.run(['.ci-venv/bin/cmake', '--build', 'build', '--parallel', '2', '--target', 'libc', *targets], check=True)
+          PY
+      - name: Confirm the new wide-formatting regression fails on baseline only
+        if: matrix.phase == 'baseline'
+        run: |
+          set +e
+          .ci-venv/bin/ctest --test-dir build/core/libs/prx/libc --output-on-failure --timeout 30 --output-junit "$RUNNER_TEMP/libc-tests.xml" > "$RUNNER_TEMP/baseline.log" 2>&1
+          task_status=$?
+          set -e
+          cat "$RUNNER_TEMP/baseline.log"
+          test "$task_status" -eq 8
+          .ci-venv/bin/python - <<'PY'
+          import os, xml.etree.ElementTree as ET
+          root = ET.parse(os.environ['RUNNER_TEMP'] + '/libc-tests.xml').getroot()
+          failures = [case.attrib['name'] for case in root.findall('.//testcase') if case.find('failure') is not None or case.find('error') is not None]
+          assert failures == ['guest_formatting'], failures
+          log = open(os.environ['RUNNER_TEMP'] + '/baseline.log').read()
+          assert 'wide precision 1:' in log, log
+          print('Confirmed: the baseline fails exactly the guest wide-formatting regression')
+          PY
+      - name: Run the fixed libc suite three times
+        if: matrix.phase == 'fixed'
+        run: .ci-venv/bin/ctest --test-dir build/core/libs/prx/libc --output-on-failure --timeout 30 --repeat until-fail:3 --output-junit "$RUNNER_TEMP/libc-tests.xml"
+      - name: Check all test registrations
+        if: matrix.phase == 'fixed'
+        run: .ci-venv/bin/python tools/check_test_registration.py build
+      - name: Run real-library PoC with protected input pages
+        if: matrix.phase == 'fixed'
+        run: |
+          set -o pipefail
+          git show "$GITHUB_SHA:.github/validation/formatter-poc.cpp" > "$RUNNER_TEMP/formatter-poc.cpp"
+          g++ -std=c++20 -O2 -Wall -Wextra -Werror -pthread -I core/libs "$RUNNER_TEMP/formatter-poc.cpp" \
+            -L build/core/libs/libs/unpatched -Wl,-rpath,"$PWD/build/core/libs/libs/unpatched" \
+            -l:libc.prx -ldl -o "$RUNNER_TEMP/formatter-poc"
+          LD_LIBRARY_PATH="$PWD/build/core/libs/libs/unpatched" "$RUNNER_TEMP/formatter-poc" | tee "$RUNNER_TEMP/formatter-poc.log"
+      - name: Build the complete project and patched libraries
+        if: matrix.phase == 'fixed'
+        run: |
+          .ci-venv/bin/cmake --build build --parallel 2
+          .ci-venv/bin/cmake --build build --target libs --parallel 2
+      - name: Run the complete repository suite three times
+        if: matrix.phase == 'fixed'
+        run: .ci-venv/bin/ctest --test-dir build --output-on-failure --timeout 30 --repeat until-fail:3 --parallel 4 --output-junit "$RUNNER_TEMP/full-tests.xml"
+        env:
+          GALLIUM_OVERRIDE_CPU_CAPS: avx
+      - name: Save evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: guest-wide-printf-${{ matrix.phase }}
+          path: |
+            ${{ runner.temp }}/libc-tests.xml
+            ${{ runner.temp }}/full-tests.xml
+            ${{ runner.temp }}/baseline.log
+            ${{ runner.temp }}/formatter-poc.log
+            build/Testing/Temporary/LastTest.log
+            build/core/libs/prx/libc/Testing/Temporary/LastTest.log
+          if-no-files-found: warn
