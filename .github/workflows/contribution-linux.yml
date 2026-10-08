@@ -1,0 +1,67 @@
+name: Collate transform Linux validation
+
+on:
+  push:
+    branches: [ci/libc-collate-transform-validation]
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: caba31b731272bafb854a5d6e2134657c6ef1d5e
+          fetch-depth: 0
+          submodules: true
+      - name: Verify exact contribution commit
+        run: test "$(git rev-parse HEAD)" = "caba31b731272bafb854a5d6e2134657c6ef1d5e"
+      - name: Create isolated build environment
+        run: |
+          python3 -m venv .ci-venv
+          .ci-venv/bin/python -m pip install cmake==4.4.4 ninja==1.13.0
+          echo "$GITHUB_WORKSPACE/.ci-venv/bin" >> "$GITHUB_PATH"
+          gcc --version
+          g++ --version
+      - name: Configure Release with tests
+        run: >-
+          .ci-venv/bin/cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+          -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+          -DANYPS5_ENABLE_SPIRV_TOOLS=OFF -DPython3_EXECUTABLE="$PWD/.ci-venv/bin/python"
+      - name: Build libc and all component executables
+        run: |
+          .ci-venv/bin/python - <<'PY'
+          import re
+          import subprocess
+          from pathlib import Path
+          listed = subprocess.check_output([".ci-venv/bin/ninja", "-C", "build", "-t", "targets", "all"], text=True)
+          available = {line.split(":", 1)[0] for line in listed.splitlines() if ":" in line}
+          source = Path("core/libs/prx/libc/CMakeLists.txt").read_text()
+          targets = [name for name in re.findall(r"add_test_executable\(\s*(\w+)", source) if name in available]
+          print("Building libc and", len(targets), "component executables", flush=True)
+          subprocess.run([".ci-venv/bin/cmake", "--build", "build", "--parallel", "2", "--target", "libc", *targets], check=True)
+          PY
+      - name: Run complete libc suite
+        run: .ci-venv/bin/ctest --test-dir build/core/libs/prx/libc --output-on-failure --timeout 120 --output-junit "$RUNNER_TEMP/libc-tests.xml"
+      - name: Check all test registrations
+        run: .ci-venv/bin/python tools/check_test_registration.py build
+      - name: Run standalone allocation PoC
+        run: |
+          git show "$GITHUB_SHA:.github/validation/collate-poc.cpp" > "$RUNNER_TEMP/collate-poc.cpp"
+          g++ -std=c++20 -O2 -Wall -Wextra -Werror -I core/libs "$RUNNER_TEMP/collate-poc.cpp" \
+            -L build/core/libs/libs/unpatched -Wl,-rpath,"$PWD/build/core/libs/libs/unpatched" \
+            -l:libc.prx -pthread -o "$RUNNER_TEMP/collate-poc"
+          LD_LIBRARY_PATH="$PWD/build/core/libs/libs/unpatched" "$RUNNER_TEMP/collate-poc" | tee "$RUNNER_TEMP/collate-poc.log"
+      - name: Save test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: collate-transform-linux-results
+          path: |
+            ${{ runner.temp }}/libc-tests.xml
+            ${{ runner.temp }}/collate-poc.log
+            build/core/libs/prx/libc/Testing/Temporary/LastTest.log
+          if-no-files-found: warn
