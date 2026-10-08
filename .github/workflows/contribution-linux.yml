@@ -1,0 +1,76 @@
+name: Guest locale Linux validation
+
+on:
+  push:
+    branches: [ci/libc-guest-locale-validation]
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      GALLIUM_OVERRIDE_CPU_CAPS: avx
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: aa83621aa00b4d85a833e7697c8f8997d5911f32
+          submodules: true
+      - name: Verify exact contribution commit
+        run: test "$(git rev-parse HEAD)" = "aa83621aa00b4d85a833e7697c8f8997d5911f32"
+      - name: Create isolated build environment
+        run: |
+          python3 -m venv .ci-venv
+          .ci-venv/bin/python -m pip install cmake==4.4.4 ninja==1.13.0
+          echo "$GITHUB_WORKSPACE/.ci-venv/bin" >> "$GITHUB_PATH"
+          .ci-venv/bin/python --version
+          .ci-venv/bin/cmake --version
+          .ci-venv/bin/ninja --version
+          gcc --version
+          g++ --version
+          locale -a
+      - name: Configure Release with tests
+        run: >-
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+          -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++
+          -DPython3_EXECUTABLE="$PWD/.ci-venv/bin/python" -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DANYPS5_ENABLE_SPIRV_TOOLS=ON
+      - name: Check production type warnings
+        run: g++ -std=c++20 -fsyntax-only -Wtype-limits -Werror=type-limits -I core/libs core/libs/prx/libc/src/LocaleSupport.cpp
+      - name: Build libc and all registered component executables
+        run: |
+          python - <<'PY'
+          import re
+          import subprocess
+          from pathlib import Path
+          listed = subprocess.check_output(["ninja", "-C", "build", "-t", "targets", "all"], text=True)
+          available = {line.split(":", 1)[0] for line in listed.splitlines() if ":" in line}
+          source = Path("core/libs/prx/libc/CMakeLists.txt").read_text()
+          targets = [name for name in re.findall(r"add_test_executable\(\s*(\w+)", source) if name in available]
+          print("Building libc and", len(targets), "component executables", flush=True)
+          subprocess.run(["cmake", "--build", "build", "--parallel", "2", "--target", "libc", *targets], check=True)
+          PY
+      - name: Run complete libc suite three times
+        run: ctest --test-dir build/core/libs/prx/libc --output-on-failure --timeout 120 --repeat until-fail:3 --parallel 4 --output-junit "$RUNNER_TEMP/libc-tests.xml"
+      - name: Verify host C and UTF-8 regression paths
+        run: ctest --test-dir build/core/libs/prx/libc --verbose -R '^guest_locale$'
+      - name: Check all test registrations
+        run: python tools/check_test_registration.py build
+      - name: Build complete project
+        run: cmake --build build --parallel 2
+      - name: Build and patch all guest libraries
+        run: cmake --build build --parallel 2 --target libs
+      - name: Run complete repository suite three times
+        run: ctest --test-dir build --output-on-failure --timeout 120 --repeat until-fail:3 --parallel 4 --output-junit "$RUNNER_TEMP/full-tests.xml"
+      - name: Save test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: guest-locale-linux-results
+          path: |
+            ${{ runner.temp }}/libc-tests.xml
+            ${{ runner.temp }}/full-tests.xml
+            build/Testing/Temporary/LastTest.log
+            build/core/libs/prx/libc/Testing/Temporary/LastTest.log
+          if-no-files-found: warn
